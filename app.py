@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+ceci est un test
 Orchestrateur CI/CD résilient pour cluster Kubernetes à nœuds hybrides.
 Version 3 — corrections (session de debug) :
   - contexte Kaniko remis en git:// (https:// fait échouer kaniko avec
