@@ -1,25 +1,12 @@
 #!/usr/bin/env python3
 """
 Orchestrateur CI/CD résilient pour cluster Kubernetes à nœuds hybrides.
-
-Principe :
-- 3 réplicas de ce programme tournent en permanence (un par nœud, via anti-affinité).
-- Un seul réplica est "leader" à un instant donné, désigné par une élection basée
-  sur un objet Lease de l'API Kubernetes (coordination.k8s.io/v1) — le même
-  mécanisme que celui utilisé en interne par kube-controller-manager et
-  kube-scheduler (cf. section 17.3 du rapport HA).
-- Seul le leader interroge GitHub (polling) et pilote le pipeline CI/CD.
-- Si le leader tombe, son bail (Lease) expire au bout de LEASE_DURATION secondes
-  sans renouvellement ; un des deux autres réplicas l'acquiert alors automatiquement.
-- L'état du pipeline (dernier commit déployé) est stocké dans un ConfigMap partagé,
-  PAS en mémoire locale — indispensable pour qu'un nouveau leader reprenne
-  exactement où l'ancien s'est arrêté, sans redéployer ni rater de commit.
+Version 2 — corrections : contexte Kaniko en https:// (au lieu de git://,
+plus fiable derrière un NAT/pare-feu, cf. difficulté rencontrée en session).
 """
 
 import os
-import sys
 import time
-import json
 import logging
 import threading
 import uuid
@@ -29,9 +16,6 @@ import requests
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
-# ---------------------------------------------------------------------------
-# Configuration (variables d'environnement, injectées par le Deployment k8s)
-# ---------------------------------------------------------------------------
 POD_NAME = os.environ.get("POD_NAME", f"unknown-{uuid.uuid4().hex[:6]}")
 NAMESPACE = os.environ.get("NAMESPACE", "cicd-system")
 
@@ -43,8 +27,8 @@ RETRY_INTERVAL = int(os.environ.get("RETRY_INTERVAL_SECONDS", "3"))
 GITHUB_OWNER = os.environ["GITHUB_OWNER"]
 GITHUB_REPO = os.environ["GITHUB_REPO"]
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")  # optionnel (dépôt public sinon)
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "15"))
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "60"))
 
 REGISTRY = os.environ.get("REGISTRY", "192.168.56.105:30500")
 IMAGE_NAME = os.environ.get("IMAGE_NAME", "demo-app")
@@ -56,7 +40,7 @@ TARGET_CONTAINER = os.environ.get("TARGET_CONTAINER", "demo-app")
 STATE_CONFIGMAP = os.environ.get("STATE_CONFIGMAP", "cicd-state")
 
 RUN_TESTS = os.environ.get("RUN_TESTS", "true").lower() == "true"
-TEST_COMMAND = os.environ.get("TEST_COMMAND", "")  # ex: "pytest -q" — vide = étape sautée
+TEST_COMMAND = os.environ.get("TEST_COMMAND", "")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,16 +48,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("orchestrator")
 
-# ---------------------------------------------------------------------------
-# Client Kubernetes (in-cluster : utilise le ServiceAccount du pod)
-# ---------------------------------------------------------------------------
 config.load_incluster_config()
 coord_api = client.CoordinationV1Api()
 core_api = client.CoreV1Api()
 batch_api = client.BatchV1Api()
 apps_api = client.AppsV1Api()
 
-# État partagé entre le thread d'élection et le thread de travail
 _lock = threading.Lock()
 _is_leader = False
 
@@ -91,24 +71,15 @@ def set_leader(value: bool):
         _is_leader = value
 
 
-# ---------------------------------------------------------------------------
-# Élection de leader (basée sur un objet Lease, avec verrouillage optimiste)
-# ---------------------------------------------------------------------------
 def _now_iso():
     return datetime.now(timezone.utc)
 
 
 def try_acquire_or_renew_lease() -> bool:
-    """
-    Retourne True si ce pod est (ou vient de devenir) leader, False sinon.
-    Implémente le même principe que client-go/leaderelection, en plus simple :
-    verrouillage optimiste via resourceVersion sur un objet Lease.
-    """
     try:
         lease = coord_api.read_namespaced_lease(LEASE_NAME, NAMESPACE)
     except ApiException as e:
         if e.status == 404:
-            # Personne n'a encore créé le bail : on tente de le créer, on devient leader
             body = client.V1Lease(
                 metadata=client.V1ObjectMeta(name=LEASE_NAME, namespace=NAMESPACE),
                 spec=client.V1LeaseSpec(
@@ -125,7 +96,7 @@ def try_acquire_or_renew_lease() -> bool:
                 return True
             except ApiException as e2:
                 if e2.status == 409:
-                    return False  # quelqu'un d'autre a créé le bail en même temps
+                    return False
                 raise
         else:
             raise
@@ -135,7 +106,6 @@ def try_acquire_or_renew_lease() -> bool:
     expired = (_now_iso() - renew_time).total_seconds() > (lease.spec.lease_duration_seconds or LEASE_DURATION)
 
     if holder == POD_NAME:
-        # Je suis déjà leader : je renouvelle mon bail
         lease.spec.renew_time = _now_iso()
         try:
             coord_api.replace_namespaced_lease(LEASE_NAME, NAMESPACE, lease)
@@ -147,10 +117,8 @@ def try_acquire_or_renew_lease() -> bool:
             raise
 
     if not expired:
-        # Quelqu'un d'autre détient un bail encore valide
         return False
 
-    # Le bail a expiré (l'ancien leader ne l'a pas renouvelé à temps) : je le reprends
     log.info("Bail expiré (dernier détenteur : %s) — tentative de reprise.", holder)
     lease.spec.holder_identity = POD_NAME
     lease.spec.acquire_time = _now_iso()
@@ -162,12 +130,11 @@ def try_acquire_or_renew_lease() -> bool:
         return True
     except ApiException as e:
         if e.status == 409:
-            return False  # un autre pod a été plus rapide
+            return False
         raise
 
 
 def leader_election_loop():
-    """Tourne en permanence dans un thread dédié : acquiert/renouvelle le bail."""
     while True:
         try:
             leader_now = try_acquire_or_renew_lease()
@@ -178,9 +145,6 @@ def leader_election_loop():
         time.sleep(RENEW_INTERVAL if am_i_leader() else RETRY_INTERVAL)
 
 
-# ---------------------------------------------------------------------------
-# État du pipeline (ConfigMap partagé — survit à un changement de leader)
-# ---------------------------------------------------------------------------
 def get_last_deployed_sha() -> str:
     try:
         cm = core_api.read_namespaced_config_map(STATE_CONFIGMAP, NAMESPACE)
@@ -201,9 +165,6 @@ def set_last_deployed_sha(sha: str):
     core_api.patch_namespaced_config_map(STATE_CONFIGMAP, NAMESPACE, body)
 
 
-# ---------------------------------------------------------------------------
-# Interrogation de GitHub (polling)
-# ---------------------------------------------------------------------------
 def get_latest_commit_sha() -> str:
     url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/commits/{GITHUB_BRANCH}"
     headers = {"Accept": "application/vnd.github+json"}
@@ -214,12 +175,8 @@ def get_latest_commit_sha() -> str:
     return resp.json()["sha"]
 
 
-# ---------------------------------------------------------------------------
-# Lancement et suivi d'un Job Kubernetes (utilisé pour Kaniko et les tests)
-# ---------------------------------------------------------------------------
 def run_job_and_wait(job_name: str, container_image: str, args=None, command=None,
                       env=None, timeout_seconds: int = 900) -> bool:
-    """Crée un Job k8s, attend sa complétion, retourne True si succès."""
     container = client.V1Container(
         name="worker",
         image=container_image,
@@ -256,17 +213,15 @@ def run_job_and_wait(job_name: str, container_image: str, args=None, command=Non
     return False
 
 
-# ---------------------------------------------------------------------------
-# Étapes du pipeline
-# ---------------------------------------------------------------------------
 def build_image(sha: str) -> str:
     short_sha = sha[:8]
     image_tag = f"{REGISTRY}/{IMAGE_NAME}:{short_sha}"
-    git_context = f"git://github.com/{GITHUB_OWNER}/{GITHUB_REPO}.git#refs/heads/{GITHUB_BRANCH}"
+    # Contexte en https:// (port 443) plutôt que git:// (port 9418) — plus
+    # robuste derrière un NAT/pare-feu qui bloque souvent le port git natif.
+    git_context = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}.git#refs/heads/{GITHUB_BRANCH}"
     if GITHUB_TOKEN:
-        # Contexte git authentifié pour un dépôt privé
         git_context = (
-            f"git://{GITHUB_TOKEN}@github.com/{GITHUB_OWNER}/{GITHUB_REPO}"
+            f"https://{GITHUB_TOKEN}@github.com/{GITHUB_OWNER}/{GITHUB_REPO}"
             f".git#refs/heads/{GITHUB_BRANCH}"
         )
 
@@ -315,9 +270,6 @@ def deploy(image_tag: str):
     apps_api.patch_namespaced_deployment(TARGET_DEPLOYMENT, TARGET_NAMESPACE, patch)
 
 
-# ---------------------------------------------------------------------------
-# Boucle principale du pipeline (n'agit que si ce pod est leader)
-# ---------------------------------------------------------------------------
 def poll_and_maybe_deploy():
     last_sha = get_last_deployed_sha()
     current_sha = get_latest_commit_sha()
@@ -355,9 +307,6 @@ def worker_loop():
             time.sleep(RETRY_INTERVAL)
 
 
-# ---------------------------------------------------------------------------
-# Point d'entrée
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     log.info("Démarrage de l'orchestrateur CI/CD (pod=%s, ns=%s)", POD_NAME, NAMESPACE)
     log.info("Dépôt surveillé : %s/%s@%s (polling toutes les %ss)",
