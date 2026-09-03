@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
 """
 Orchestrateur CI/CD résilient pour cluster Kubernetes à nœuds hybrides.
-Version 2 — corrections : contexte Kaniko en https:// (au lieu de git://,
-plus fiable derrière un NAT/pare-feu, cf. difficulté rencontrée en session).
+Version 3 — corrections (session de debug) :
+  - contexte Kaniko remis en git:// (https:// fait échouer kaniko avec
+    "gzip: invalid header", car l'URL est alors traitée comme une archive
+    tar.gz au lieu d'être clonée comme un dépôt Git)
+  - image kaniko pinnée en v1.23.1 (:latest segfault au démarrage sur
+    certains nœuds du cluster — Exit Code 139 avant la première ligne
+    de log, reproductible et corrigé par ce pin de version)
 """
 
 import os
 import time
+import json
+import hmac
+import hashlib
 import logging
 import threading
 import uuid
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 from kubernetes import client, config
@@ -29,6 +38,15 @@ GITHUB_REPO = os.environ["GITHUB_REPO"]
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "60"))
+
+# --- Webhook ---
+# Le webhook est le déclencheur principal (quasi instantané). Le polling
+# GitHub ci-dessus reste actif comme filet de sécurité si un webhook est
+# manqué (tunnel smee.io coupé, redémarrage, etc.) — d'où l'intérêt de
+# garder POLL_INTERVAL raisonnable (ex. 300s) plutôt que de le désactiver.
+GITHUB_WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
+WEBHOOK_PORT = int(os.environ.get("WEBHOOK_PORT", "8000"))
+LEADER_TICK_SECONDS = int(os.environ.get("LEADER_TICK_SECONDS", "3"))
 
 REGISTRY = os.environ.get("REGISTRY", "192.168.56.105:30500")
 IMAGE_NAME = os.environ.get("IMAGE_NAME", "demo-app")
@@ -145,10 +163,11 @@ def leader_election_loop():
         time.sleep(RENEW_INTERVAL if am_i_leader() else RETRY_INTERVAL)
 
 
-def get_last_deployed_sha() -> str:
+def read_state() -> dict:
+    """Lit la ConfigMap d'état (lastDeployedSha, webhookSha...), la crée si absente."""
     try:
         cm = core_api.read_namespaced_config_map(STATE_CONFIGMAP, NAMESPACE)
-        return (cm.data or {}).get("lastDeployedSha", "")
+        return cm.data or {}
     except ApiException as e:
         if e.status == 404:
             body = client.V1ConfigMap(
@@ -156,13 +175,26 @@ def get_last_deployed_sha() -> str:
                 data={"lastDeployedSha": ""},
             )
             core_api.create_namespaced_config_map(NAMESPACE, body)
-            return ""
+            return {"lastDeployedSha": ""}
         raise
 
 
-def set_last_deployed_sha(sha: str):
-    body = client.V1ConfigMap(data={"lastDeployedSha": sha})
+def patch_state(fields: dict):
+    """Met à jour un ou plusieurs champs de la ConfigMap d'état.
+    Utilisable par n'importe quel pod (leader ou non), notamment le
+    handler webhook — RBAC 'patch configmaps' déjà accordé dans 02-rbac.yaml.
+    """
+    read_state()  # garantit que la ConfigMap existe avant de la patcher
+    body = client.V1ConfigMap(data=fields)
     core_api.patch_namespaced_config_map(STATE_CONFIGMAP, NAMESPACE, body)
+
+
+def get_last_deployed_sha() -> str:
+    return read_state().get("lastDeployedSha", "")
+
+
+def set_last_deployed_sha(sha: str):
+    patch_state({"lastDeployedSha": sha})
 
 
 def get_latest_commit_sha() -> str:
@@ -216,9 +248,12 @@ def run_job_and_wait(job_name: str, container_image: str, args=None, command=Non
 def build_image(sha: str) -> str:
     short_sha = sha[:8]
     image_tag = f"{REGISTRY}/{IMAGE_NAME}:{short_sha}"
-    # Contexte en https:// (port 443) plutôt que git:// (port 9418) — plus
-    # robuste derrière un NAT/pare-feu qui bloque souvent le port git natif.
-    git_context = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}.git#refs/heads/{GITHUB_BRANCH}"
+    # git:// est le contexte fonctionnel pour kaniko sur ce dépôt public.
+    # https:// échoue avec "gzip: invalid header" (kaniko tente de le
+    # traiter comme une archive tar.gz plutôt que de cloner le dépôt).
+    # On garde https:// uniquement dans le cas avec token ci-dessous, car
+    # un token d'authentification ne peut pas être passé via git://.
+    git_context = f"git://github.com/{GITHUB_OWNER}/{GITHUB_REPO}.git#refs/heads/{GITHUB_BRANCH}"
     if GITHUB_TOKEN:
         git_context = (
             f"https://{GITHUB_TOKEN}@github.com/{GITHUB_OWNER}/{GITHUB_REPO}"
@@ -227,7 +262,7 @@ def build_image(sha: str) -> str:
 
     ok = run_job_and_wait(
         job_name=f"kaniko-build-{short_sha}-{int(time.time())}",
-        container_image="gcr.io/kaniko-project/executor:latest",
+        container_image="gcr.io/kaniko-project/executor:v1.23.1",
         args=[
             f"--context={git_context}",
             "--dockerfile=Dockerfile",
@@ -270,14 +305,7 @@ def deploy(image_tag: str):
     apps_api.patch_namespaced_deployment(TARGET_DEPLOYMENT, TARGET_NAMESPACE, patch)
 
 
-def poll_and_maybe_deploy():
-    last_sha = get_last_deployed_sha()
-    current_sha = get_latest_commit_sha()
-
-    if current_sha == last_sha:
-        log.debug("Aucun nouveau commit (sha=%s).", current_sha[:8])
-        return
-
+def process_commit(current_sha: str, last_sha: str):
     log.info("Nouveau commit détecté : %s (précédent : %s)",
               current_sha[:8], last_sha[:8] if last_sha else "aucun")
 
@@ -296,23 +324,133 @@ def poll_and_maybe_deploy():
 
 
 def worker_loop():
+    """Boucle du leader : réagit en priorité au SHA reçu par webhook (quasi
+    instantané), et retombe sur un polling GitHub classique en filet de
+    sécurité si aucun webhook n'a été reçu depuis POLL_INTERVAL secondes.
+    """
+    last_api_poll_time = 0.0
     while True:
         if am_i_leader():
             try:
-                poll_and_maybe_deploy()
+                state = read_state()
+                last_sha = state.get("lastDeployedSha", "")
+                webhook_sha = state.get("webhookSha", "")
+
+                current_sha = ""
+                if webhook_sha and webhook_sha != last_sha:
+                    current_sha = webhook_sha
+                    log.info("Déclenchement via webhook (sha=%s).", current_sha[:8])
+                elif time.time() - last_api_poll_time >= POLL_INTERVAL:
+                    last_api_poll_time = time.time()
+                    polled_sha = get_latest_commit_sha()
+                    if polled_sha != last_sha:
+                        current_sha = polled_sha
+                        log.info("Déclenchement via polling de secours (sha=%s).", current_sha[:8])
+                    else:
+                        log.debug("Polling de secours : aucun nouveau commit (sha=%s).", polled_sha[:8])
+
+                if current_sha and current_sha != last_sha:
+                    process_commit(current_sha, last_sha)
             except Exception:
                 log.exception("Erreur pendant le cycle de pipeline.")
-            time.sleep(POLL_INTERVAL)
+            time.sleep(LEADER_TICK_SECONDS)
         else:
             time.sleep(RETRY_INTERVAL)
 
 
+def verify_webhook_signature(raw_body: bytes, signature_header: str) -> bool:
+    if not GITHUB_WEBHOOK_SECRET:
+        # Aucun secret configuré : on accepte quand même (utile pour un test
+        # rapide en réseau privé), mais ce n'est pas recommandé même sur un
+        # tunnel smee.io — configurez toujours GITHUB_WEBHOOK_SECRET.
+        log.warning("GITHUB_WEBHOOK_SECRET non défini — signature non vérifiée !")
+        return True
+    if not signature_header or not signature_header.startswith("sha256="):
+        return False
+    expected = "sha256=" + hmac.new(
+        GITHUB_WEBHOOK_SECRET.encode(), raw_body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature_header)
+
+
+class WebhookHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        if self.path != "/webhook":
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        length = int(self.headers.get("Content-Length", 0))
+        raw_body = self.rfile.read(length) if length else b""
+        signature = self.headers.get("X-Hub-Signature-256", "")
+
+        if not verify_webhook_signature(raw_body, signature):
+            log.warning("Webhook reçu avec signature invalide — ignoré.")
+            self.send_response(401)
+            self.end_headers()
+            return
+
+        event = self.headers.get("X-GitHub-Event", "")
+        if event == "ping":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"pong")
+            return
+        if event != "push":
+            self.send_response(200)
+            self.end_headers()
+            return
+
+        try:
+            payload = json.loads(raw_body.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            log.warning("Webhook : payload JSON invalide.")
+            self.send_response(400)
+            self.end_headers()
+            return
+
+        ref = payload.get("ref", "")
+        repo_name = (payload.get("repository") or {}).get("name", "")
+        expected_ref = f"refs/heads/{GITHUB_BRANCH}"
+
+        if repo_name != GITHUB_REPO or ref != expected_ref:
+            log.info("Webhook ignoré (repo=%s ref=%s ; attendu repo=%s ref=%s).",
+                      repo_name, ref, GITHUB_REPO, expected_ref)
+            self.send_response(200)
+            self.end_headers()
+            return
+
+        sha = payload.get("after", "")
+        if sha:
+            try:
+                patch_state({"webhookSha": sha})
+                log.info("Webhook accepté : nouveau commit %s sur %s.", sha[:8], repo_name)
+            except Exception:
+                log.exception("Impossible d'enregistrer le sha reçu par webhook.")
+
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        # Coupe les logs HTTP par défaut (bruyants), on logge nous-mêmes ci-dessus.
+        pass
+
+
+def start_webhook_server():
+    server = ThreadingHTTPServer(("0.0.0.0", WEBHOOK_PORT), WebhookHandler)
+    log.info("Serveur webhook démarré sur le port %s (endpoint /webhook).", WEBHOOK_PORT)
+    server.serve_forever()
+
+
 if __name__ == "__main__":
     log.info("Démarrage de l'orchestrateur CI/CD (pod=%s, ns=%s)", POD_NAME, NAMESPACE)
-    log.info("Dépôt surveillé : %s/%s@%s (polling toutes les %ss)",
+    log.info("Dépôt surveillé : %s/%s@%s (webhook prioritaire, polling de secours toutes les %ss)",
               GITHUB_OWNER, GITHUB_REPO, GITHUB_BRANCH, POLL_INTERVAL)
 
     election_thread = threading.Thread(target=leader_election_loop, daemon=True)
     election_thread.start()
+
+    webhook_thread = threading.Thread(target=start_webhook_server, daemon=True)
+    webhook_thread.start()
 
     worker_loop()
